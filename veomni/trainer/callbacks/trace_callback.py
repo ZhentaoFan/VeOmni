@@ -107,6 +107,9 @@ class MoERouterMonitorCallback(Callback):
         metrics = self.monitor.compute_metrics(
             current_step=state.global_step,
             format_only_on=args.train.global_rank == 0,
+            # This callback only sends images to WandB. Scalar-only logging
+            # must not render images that would immediately be discarded.
+            render_heatmaps=args.train.wandb.enable,
         )
         if not metrics:
             return

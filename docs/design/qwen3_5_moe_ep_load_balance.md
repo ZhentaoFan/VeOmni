@@ -115,6 +115,13 @@ For each layer, moved-token fraction is `moved_tokens / total_routed_tokens`, or
 
 Before/after physical-rank heatmaps are media values; scalar sinks must not serialize them as numbers. Every rank participates in the interval collectives, while only the formatting/logging rank publishes scalar/media output.
 
+The training callback requests heatmap rendering only when WandB image logging
+is enabled. With WandB disabled it retains every scalar, collective and interval
+reset, but avoids creating PIL images that have no consumer. Direct callers of
+`MoERouterMonitor.compute_metrics` retain images by default and may explicitly
+pass `render_heatmaps=False` for scalar-only sinks. This does not change logging
+cadence or the enabled-WandB image path.
+
 ## Synthetic accelerator E2E
 
 `tests/e2e/test_qwen3_5_moe_ep_load_balance.py` skips before dataset or checkpoint creation unless at least four compatible devices and required packages are available. CUDA must be NVIDIA rather than ROCm, each of the four selected devices must be SM70 or newer, and the `triton`, `fla`, `flash_attn`, and `liger_kernel` imports must resolve. NPU requires both `torch_npu` and the `triton` import provided by `triton-ascend`. It creates one seed-0 CPU-fp32, native-stacked toy checkpoint and reuses one dummy dataset for exactly two matched four-process FSDP2/SP=1/EP=2 jobs.
