@@ -16,6 +16,30 @@
 import torch
 
 
+def compact_permute(tokens: torch.Tensor, selected_experts: torch.Tensor):
+    """Stable expert-major dispatch without a dense expert/token mask.
+
+    Native top-k and its replica aliases have unique physical IDs per token.
+    Keep the flattened occurrence index so combine can recover its exact weight.
+    """
+    topk = selected_experts.shape[-1]
+    if topk == 0:
+        raise ValueError("Compact EP dispatch requires at least one selected expert.")
+    order = torch.argsort(selected_experts.reshape(-1), stable=True)
+    token_indices = torch.div(order, topk, rounding_mode="floor")
+    return tokens.index_select(0, token_indices), order
+
+
+def compact_unpermute(tokens, routing_weights, hidden_states_shape, occurrence_order):
+    """Preserve expert-major multiplication and the existing FP32 scatter sum."""
+    weights = routing_weights.reshape(-1).index_select(0, occurrence_order)
+    weighted_tokens = tokens * weights.unsqueeze(-1)
+    token_indices = torch.div(occurrence_order, routing_weights.shape[-1], rounding_mode="floor")
+    output = torch.zeros(hidden_states_shape, dtype=torch.float32, device=tokens.device)
+    output.scatter_add_(0, token_indices.unsqueeze(1).expand(-1, hidden_states_shape[-1]), weighted_tokens.float())
+    return output.to(weighted_tokens.dtype)
+
+
 def permute(tokens: torch.Tensor, routing_map: torch.Tensor):
     """
     Permutes the tokens according to the routing map.

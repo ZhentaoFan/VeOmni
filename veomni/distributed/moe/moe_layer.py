@@ -27,7 +27,14 @@ from .ep_load_balance import (
     _validate_executor_plan,
     cat_local_and_replica_weights,
 )
-from .moe_utils import generate_weights_idx, permute, sort_chunks_by_idxs, unpermute
+from .moe_utils import (
+    compact_permute,
+    compact_unpermute,
+    generate_weights_idx,
+    permute,
+    sort_chunks_by_idxs,
+    unpermute,
+)
 
 
 if not is_torch_npu_available():
@@ -101,13 +108,19 @@ def token_pre_all2all(
     output_splits: torch.Tensor,
     num_global_tokens_per_local_expert: torch.Tensor,
     ep_group: Optional[dist.ProcessGroup] = None,
+    selected_experts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     hidden_dim = hidden_states.size(-1)
     hidden_states = hidden_states.reshape(-1, hidden_dim)
     org_hidden_states_shape = hidden_states.shape
-    routing_map = expert_mask.sum(dim=1)
-
-    local_permuted_hidden_states, local_input_permutation_mapping = permute(hidden_states, routing_map)
+    if selected_experts is None:
+        routing_map = expert_mask.sum(dim=1)
+        local_permuted_hidden_states, local_input_permutation_mapping = permute(hidden_states, routing_map)
+    else:
+        routing_map = None
+        local_permuted_hidden_states, local_input_permutation_mapping = compact_permute(
+            hidden_states, selected_experts
+        )
 
     global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
 
@@ -284,18 +297,15 @@ def _dispatch_to_balanced_ep(
     physical_slots_per_rank = plan.tokens_per_local_physical_expert.shape[1]
     physical_num_experts = plan.ep_size * physical_slots_per_rank if plan.replicas else num_experts
     selected_physical_experts = plan.selected_physical_experts
-    expert_mask = torch.nn.functional.one_hot(
-        selected_physical_experts,
-        num_classes=physical_num_experts,
-    ).permute(2, 1, 0)
     permute_tokens, routing_map, local_input_permutation_mapping, org_hidden_states_shape = token_pre_all2all(
         hidden_states=hidden_states,
-        expert_mask=expert_mask,
+        expert_mask=None,
         num_experts=physical_num_experts,
         input_splits=plan.input_splits,
         output_splits=plan.output_splits,
         num_global_tokens_per_local_expert=plan.tokens_per_local_physical_expert,
         ep_group=ep_group,
+        selected_experts=selected_physical_experts,
     )
 
     if gate_up_transfer is not None and down_transfer is not None:
@@ -436,6 +446,11 @@ def tokens_post_all2all(
     )
 
     unpermute_outputs = all_to_all(ep_group, expert_outputs, input_splits, output_splits)
+
+    if routing_map is None:
+        return compact_unpermute(
+            unpermute_outputs, routing_weights, org_hidden_states_shape, local_input_permutation_mapping
+        )
 
     # [tokens, experts]
     weights_idx = generate_weights_idx(routing_weights, selected_experts, num_experts)

@@ -32,6 +32,17 @@ For example, `[100, 100, 0, 0]` first becomes `[50, 100, 50, 0]`, then `[50, 50,
 
 ## Physical alias namespace
 
+The CUDA balanced path sorts flattened top-k occurrences stably by physical
+expert ID instead of materializing dense expert/token masks and routing-weight
+matrices. Native Qwen top-k yields unique logical IDs per token, and the alias
+mapping preserves per-token physical uniqueness. Across-token repetitions are
+retained, as are logical repetitions that map to different physical aliases.
+This path keeps the same expert-major/token-major order, sender/expert block
+transposes, BF16 multiplication and FP32 scatter accumulation. In particular,
+it does not inverse-permute into top-k slot order before summation. Empty ranks
+still participate in communication and autograd. The NPU fused permutation
+path and the disabled-feature path are unchanged.
+
 Let `E` be the number of logical experts, `R` the EP size, `L = E / R` the original experts per rank, `K` the fixed `max_replicas_per_rank`, and `S = L + K` the physical stride.
 
 - Original logical expert `e` maps to physical ID `floor(e / L) * S + (e mod L)`.
