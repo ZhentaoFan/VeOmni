@@ -459,19 +459,23 @@ def _allocate_replica_rows(
     counts: torch.Tensor,
     replica_states: list[_ReplicaState],
 ) -> tuple[torch.Tensor, list[tuple[int, ...]]]:
-    remaining_counts = counts.clone()
+    # Counts have already been validated and transferred to the host. Keep
+    # scalar bookkeeping in Python rather than dispatching one Tensor op per
+    # replica/sender cell, then materialize the result once.
+    remaining_values = counts.tolist()
     allocations_by_replica = []
     for state in replica_states:
         remaining = state.moved_tokens
         row_allocations = []
         for sender in range(counts.shape[0]):
-            moved = min(remaining, int(remaining_counts[sender, state.source_expert].item()))
-            remaining_counts[sender, state.source_expert] -= moved
+            moved = min(remaining, remaining_values[sender][state.source_expert])
+            remaining_values[sender][state.source_expert] -= moved
             row_allocations.append(moved)
             remaining -= moved
         if remaining != 0:
             raise RuntimeError("A replica requests more concrete occurrences than its source expert owns.")
         allocations_by_replica.append(tuple(row_allocations))
+    remaining_counts = torch.tensor(remaining_values, dtype=counts.dtype, device=counts.device).reshape_as(counts)
     return remaining_counts, allocations_by_replica
 
 
@@ -557,19 +561,15 @@ def _build_ep_balance_plan_from_counts(
 
     physical_slots_per_rank = stride
     local_physical_counts = torch.zeros((ep_size, physical_slots_per_rank), dtype=torch.long)
-    for expert in range(num_experts):
-        owner = expert // num_local_experts
-        if owner == ep_rank:
-            local_physical_counts[:, expert % num_local_experts] = remaining_counts[:, expert]
+    start = ep_rank * num_local_experts
+    local_physical_counts[:, :num_local_experts] = remaining_counts[:, start : start + num_local_experts]
     for replica, row_allocations in zip(replicas, allocations_by_replica, strict=True):
         if replica.target_rank == ep_rank:
             local_physical_counts[:, num_local_experts + replica.target_slot] = torch.tensor(
                 row_allocations, dtype=torch.long
             )
 
-    input_splits = [0] * ep_size
-    for expert in range(num_experts):
-        input_splits[expert // num_local_experts] += int(remaining_counts[ep_rank, expert].item())
+    input_splits = remaining_counts[ep_rank].reshape(ep_size, num_local_experts).sum(dim=1).tolist()
     for replica, row_allocations in zip(replicas, allocations_by_replica, strict=True):
         input_splits[replica.target_rank] += row_allocations[ep_rank]
     output_splits = tuple(int(value) for value in local_physical_counts.sum(dim=1).tolist())

@@ -277,6 +277,32 @@ def test_randomized_plans_are_deterministic_and_conservative():
         _assert_global_invariants(counts, plans)
 
 
+@pytest.mark.parametrize("ep_size,local_experts", [(2, 2), (4, 4), (8, 32)])
+def test_bulk_replica_allocations_match_scalar_reference_without_mutating_counts(ep_size, local_experts):
+    generator = torch.Generator().manual_seed(616)
+    for _ in range(20):
+        counts = torch.randint(0, 40, (ep_size, ep_size * local_experts), generator=generator)
+        original = counts.clone()
+        states, _, _, _ = ep_load_balance._plan_replicas(counts, ep_size, ep_size * local_experts, local_experts, 1)
+        expected = counts.clone()
+        expected_allocations = []
+        for state in states:
+            left = state.moved_tokens
+            row = []
+            for sender in range(ep_size):
+                moved = min(left, int(expected[sender, state.source_expert]))
+                expected[sender, state.source_expert] -= moved
+                row.append(moved)
+                left -= moved
+            assert left == 0
+            expected_allocations.append(tuple(row))
+        actual, allocations = ep_load_balance._allocate_replica_rows(counts, states)
+        assert torch.equal(counts, original)
+        assert torch.equal(actual, expected)
+        assert actual.dtype == counts.dtype
+        assert allocations == expected_allocations
+
+
 def _gloo_plan_worker(rank: int, world_size: int, rendezvous: str) -> None:
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
     try:

@@ -52,6 +52,13 @@ The namespace keeps every rank's original rows first and fixed replica slots sec
 
 The plan contains rewritten IDs, EP input/output splits, per-sender counts for every local physical row, replica ownership, moved-token counts, and before/after physical rank loads. Validation checks integer IDs, local histogram agreement, token conservation, unique target slots, alias formulas, and consistent group/expert dimensions before communication starts.
 
+Once the histogram is on the host, replica occurrence quotas use Python integer
+bookkeeping and materialize the remaining-count tensor once. Local expert columns
+are copied as one slice and per-destination input splits are summed in bulk.
+This removes per-cell Tensor dispatch without changing the greedy objective,
+replica order, sender priority, aliases, or validation. There is no cross-forward
+plan or weight cache, and the same host optimization serves CUDA and NPU.
+
 ## Temporary weights and gradients
 
 Qwen3.5's merged expert has two parameter tensors that must move together: the merged gate/up projection and the down projection. The dispatcher validates both tensors first, then starts two asynchronous point-to-point transfers over the same EP group. A target rank receives each copied row into a fixed temporary tensor and concatenates original rows followed by replica rows.
