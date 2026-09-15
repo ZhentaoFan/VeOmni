@@ -59,6 +59,12 @@ This removes per-cell Tensor dispatch without changing the greedy objective,
 replica order, sender priority, aliases, or validation. There is no cross-forward
 plan or weight cache, and the same host optimization serves CUDA and NPU.
 
+Greedy search stops once the largest and smallest physical rank loads differ
+by at most one token. For a conserved integer token total, this is the globally
+minimal descending-sorted load profile; no further replica can strictly improve
+the objective. This is an exact stopping condition, not a heuristic imbalance
+threshold, and does not bypass input validation, dispatch, or monitoring.
+
 ## Temporary weights and gradients
 
 Qwen3.5's merged expert has two parameter tensors that must move together: the merged gate/up projection and the down projection. The dispatcher validates both tensors first, then starts two asynchronous point-to-point transfers over the same EP group. A target rank receives each copied row into a fixed temporary tensor and concatenates original rows followed by replica rows.

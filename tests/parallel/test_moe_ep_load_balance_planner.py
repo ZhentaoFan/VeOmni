@@ -303,6 +303,28 @@ def test_bulk_replica_allocations_match_scalar_reference_without_mutating_counts
         assert allocations == expected_allocations
 
 
+@pytest.mark.parametrize("loads", [(0, 0), (1, 0), (8, 8, 8, 8), (101, 100, 101, 100), (32,) * 8])
+def test_integer_optimal_rank_loads_do_not_search_equivalent_replica_moves(monkeypatch, loads):
+    ep_size, local_experts = len(loads), 4
+    num_experts = ep_size * local_experts
+    counts = torch.zeros(ep_size, num_experts, dtype=torch.long)
+    # Experts can be highly skewed within a rank while physical rank loads
+    # already attain the global integer lower bound.
+    for owner, load in enumerate(loads):
+        counts[0, owner * local_experts] = load
+
+    def unexpected_waterfill(*args, **kwargs):
+        pytest.fail("An integer-optimal rank profile must not search replica moves.")
+
+    monkeypatch.setattr(ep_load_balance, "_waterfill_allocations", unexpected_waterfill)
+    replicas, before, after, allocations = ep_load_balance._plan_replicas(
+        counts, ep_size, num_experts, local_experts, 1
+    )
+    assert replicas == []
+    assert before == after == list(loads)
+    assert sum(sum(row.values()) for row in allocations) == sum(loads)
+
+
 def _gloo_plan_worker(rank: int, world_size: int, rendezvous: str) -> None:
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
     try:

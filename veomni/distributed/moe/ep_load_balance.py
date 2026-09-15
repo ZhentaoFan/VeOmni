@@ -374,6 +374,11 @@ def _plan_replicas(
     used_slots: list[set[int]] = [set() for _ in range(ep_size)]
 
     while True:
+        # Integer loads that differ by at most one already attain the minimum
+        # descending-sorted profile for this fixed token total. No replica can
+        # strictly improve the objective, so avoid searching equivalent moves.
+        if max(rank_loads) - min(rank_loads) <= 1:
+            break
         candidate_experts = []
         for expert in range(num_experts):
             owner = expert // num_local_experts
