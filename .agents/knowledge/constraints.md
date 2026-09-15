@@ -202,3 +202,9 @@ Core files:
 29. **EP-global plan telemetry must contribute only once per EP group**
     - The load-balancing planner has already gathered all EP senders. Recording its totals on every sibling and then summing over the FSDP/DP+SP group inflates absolute counts by `ep_size`.
     - Record physical plans only on EP-local rank 0; all ranks still join monitoring collectives. Rank-local router histograms continue to sum every distinct token slice.
+
+30. **EP replica reduction must preserve the original accumulation order**
+    - Returning FP32 gradients through a BF16 custom-autograd input edge casts them back before the preceding node. Keep replica weight-gradient communication inside the fused expert backward boundary.
+    - Independently computed FP32 partials still change the GEMM reduction tree. CUDA replica quotas align with the original weight-gradient BLOCK_K, and replicas forward an FP32 prefix accumulator in original sender/token order; the owner continues with its suffix before the final dtype conversion.
+    - Use the original owner's total token count for kernel configuration selection. Do not select a new algorithm from a replica's smaller local token count.
+    - Preserve logical expert ordering for duplicated token-gradient and top-k output reductions; physical alias order is not numerically equivalent.

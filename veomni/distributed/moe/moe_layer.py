@@ -756,7 +756,8 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         return fc2_output
 
     @staticmethod
-    def backward(ctx, grad_output, *, weight_gradient_dtype=None, weight_needs_grad=None):
+    def backward(ctx, grad_output, *, weight_gradient_dtype=None, weight_needs_grad=None, weight_grad_fn=None):
+        weight_grad_fn = group_gemm_same_mn if weight_grad_fn is None else weight_grad_fn
         (
             permute_tokens,
             cumsum,
@@ -786,7 +787,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         grad_fc2_weight = None
         if fc2_weight.requires_grad if weight_needs_grad is None else weight_needs_grad[1]:
             grad_fc2_weight = torch.empty_like(fc2_weight, dtype=weight_gradient_dtype)
-            group_gemm_same_mn(
+            weight_grad_fn(
                 a=grad_output,
                 b=fc1_result,
                 c=grad_fc2_weight,
@@ -821,7 +822,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         grad_fc1_1_2_weight = None
         if fc1_1_2_weight.requires_grad if weight_needs_grad is None else weight_needs_grad[0]:
             grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight, dtype=weight_gradient_dtype)
-            group_gemm_same_mn(
+            weight_grad_fn(
                 a=grad_fc1_output,
                 b=permute_tokens,
                 c=grad_fc1_1_2_weight,
@@ -860,18 +861,27 @@ class _BalancedEPMergedFc1GroupGemm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        dx, _, dgate, ddown, _ = EPMergedFc1GroupGemm.backward(
-            ctx,
-            grad_output,
-            weight_gradient_dtype=torch.float32,
-            weight_needs_grad=(ctx.needs_input_grad[2], ctx.needs_input_grad[3]),
+        kwargs = dict(
+            weight_gradient_dtype=torch.float32, weight_needs_grad=(ctx.needs_input_grad[2], ctx.needs_input_grad[3])
         )
+        ordered = grad_output.is_cuda
+        if ordered and any(kwargs["weight_needs_grad"]):
+            from .ep_grad import make_ordered_weight_grad
+
+            kwargs["weight_grad_fn"] = make_ordered_weight_grad(
+                ctx.replica_plan, ctx.replica_group, grad_output.device
+            )
+        dx, _, dgate, ddown, _ = EPMergedFc1GroupGemm.backward(ctx, grad_output, **kwargs)
         if dgate is not None:
-            dgate = _merge_replica_weight_gradients(dgate, ctx.replica_plan, ctx.replica_group).to(
-                ctx.original_weight_dtype
-            )
+            dgate = (
+                dgate[: ctx.replica_plan.num_local_experts]
+                if ordered
+                else _merge_replica_weight_gradients(dgate, ctx.replica_plan, ctx.replica_group)
+            ).to(ctx.original_weight_dtype)
         if ddown is not None:
-            ddown = _merge_replica_weight_gradients(ddown, ctx.replica_plan, ctx.replica_group).to(
-                ctx.original_weight_dtype
-            )
+            ddown = (
+                ddown[: ctx.replica_plan.num_local_experts]
+                if ordered
+                else _merge_replica_weight_gradients(ddown, ctx.replica_plan, ctx.replica_group)
+            ).to(ctx.original_weight_dtype)
         return dx, None, dgate, ddown, None, None, None, None, None

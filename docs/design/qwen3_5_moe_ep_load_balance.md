@@ -89,9 +89,23 @@ partial expert weight gradients and their P2P payloads stay FP32 until the logic
 owner has accumulated all contributions. Only then are owner gradients converted
 to the input parameter dtype. A separate BF16 concatenation edge would otherwise
 round each partial before the owner receives it, even if backward returned FP32.
-This doubles low-precision replica-gradient communication bytes but avoids FP32
-forward-weight copies; it does not promise bitwise agreement with a different
-FP32 GEMM reduction tree. The no-replica, disabled and NPU paths are unchanged.
+Independent FP32 partials are not sufficient: their addition changes the original
+GEMM reduction tree. CUDA now moves only tile-aligned consecutive token prefixes.
+Each replica continues the preceding FP32 accumulator using the original kernel;
+the final replica sends the state to the owner, which continues with its suffix.
+The original owner's total token count remains the kernel configuration key.
+This preserves the original block order without changing the disabled algorithm.
+Replica quotas use the least common multiple of configured weight-gradient
+`BLOCK_K` values; rounded plans that fail to improve the load profile are rejected.
+The existing histogram collective also verifies tile-configuration signatures
+across EP ranks, rejecting disagreement before alias dispatch.
+
+FP32 payloads double low-precision replica-gradient communication bytes, and the
+ordered chain serializes an expert's weight-gradient segments. Neither this fix
+nor a more balanced token histogram guarantees an end-to-end speedup. The
+no-replica, disabled and NPU computation paths are unchanged. Numerical evidence
+must state the tested dtype, kernel configurations, shapes and training duration;
+it is not an unrestricted bitwise guarantee for every accelerator or backend.
 
 ## Configuration and failure behavior
 

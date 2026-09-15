@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
@@ -489,6 +489,8 @@ def _build_ep_balance_plan_from_counts(
     num_experts: int,
     ep_rank: int,
     max_replicas_per_rank: int,
+    *,
+    token_granularity: int = 1,
 ) -> EPBalancePlan:
     """Pure count-driven planning helper used by the public collective entry point."""
     ep_size, num_local_experts, counts = _validate_planner_inputs(
@@ -505,6 +507,24 @@ def _build_ep_balance_plan_from_counts(
         num_local_experts,
         max_replicas_per_rank,
     )
+
+    if type(token_granularity) is not int or token_granularity <= 0:
+        raise ValueError("token_granularity must be a positive integer.")
+    if token_granularity > 1:
+        replica_states = [
+            replace(state, moved_tokens=state.moved_tokens // token_granularity * token_granularity)
+            for state in replica_states
+            if state.moved_tokens >= token_granularity
+        ]
+        rank_loads_after = rank_loads_before.copy()
+        for state in replica_states:
+            rank_loads_after[state.source_rank] -= state.moved_tokens
+            rank_loads_after[state.target_rank] += state.moved_tokens
+        # Quantization can remove useful outgoing moves from a rank that is
+        # also a target. Never retain a rounded plan that worsens the objective.
+        if _rank_load_profile(rank_loads_after) >= _rank_load_profile(rank_loads_before):
+            replica_states = []
+            rank_loads_after = rank_loads_before.copy()
 
     if not replica_states:
         start = ep_rank * num_local_experts
@@ -604,6 +624,18 @@ def _build_ep_balance_plan_from_counts(
     )
 
 
+def _gather_counts_with_kernel_metadata(local_counts, ep_group, metadata):
+    """Check configuration agreement in the existing histogram collective."""
+    local = torch.cat((local_counts, local_counts.new_tensor(metadata)))
+    gathered = local.new_empty(dist.get_world_size(ep_group) * local.numel())
+    dist.all_gather_into_tensor(gathered, local, group=ep_group)
+    gathered = gathered.reshape(-1, local.numel()).cpu()
+    configurations = gathered[:, -2:].tolist()
+    if any(config != configurations[0] for config in configurations[1:]):
+        raise ValueError("Ordered EP weight gradients require identical kernel configurations on every EP rank.")
+    return gathered[:, :-2]
+
+
 def build_ep_balance_plan(
     selected_experts: torch.Tensor,
     num_experts: int,
@@ -643,18 +675,24 @@ def build_ep_balance_plan(
     ):
         raise ValueError(f"selected_experts IDs must be in [0, {num_experts}).")
     local_counts = torch.bincount(flat_selected.to(dtype=torch.long), minlength=num_experts)
-    gathered_counts_flat = torch.empty(
-        ep_size * num_experts,
-        dtype=torch.long,
-        device=selected_experts.device,
-    )
-    dist.all_gather_into_tensor(gathered_counts_flat, local_counts, group=ep_group)
+    granularity = 1
+    if selected_experts.is_cuda:
+        from .ep_grad import weight_grad_config_metadata
+
+        metadata = weight_grad_config_metadata()
+        granularity = metadata[0]
+        gathered_counts = _gather_counts_with_kernel_metadata(local_counts, ep_group, metadata)
+    else:
+        gathered_counts_flat = local_counts.new_empty(ep_size * num_experts)
+        dist.all_gather_into_tensor(gathered_counts_flat, local_counts, group=ep_group)
+        gathered_counts = gathered_counts_flat.reshape(ep_size, num_experts)
     return _build_ep_balance_plan_from_counts(
         selected_experts=selected_experts,
-        tokens_per_expert_by_rank=gathered_counts_flat.reshape(ep_size, num_experts),
+        tokens_per_expert_by_rank=gathered_counts,
         num_experts=num_experts,
         ep_rank=ep_rank,
         max_replicas_per_rank=max_replicas_per_rank,
+        token_granularity=granularity,
     )
 
 

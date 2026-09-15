@@ -337,7 +337,7 @@ def group_gemm_same_mn_kernel(
         return
 
     if ACCUMULATE_TO_C:
-        out = tl.load(c_block_ptr).to(tl.float32)
+        out = load_block_with_pred_2d(c_block_ptr, M_ALIGNED, N_ALIGNED).to(tl.float32)
     else:
         out = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
