@@ -30,6 +30,7 @@ from .ep_load_balance import (
     cat_local_and_replica_weights,
 )
 from .moe_utils import (
+    alias_permute,
     compact_permute,
     compact_unpermute,
     generate_weights_idx,
@@ -111,6 +112,7 @@ def token_pre_all2all(
     num_global_tokens_per_local_expert: torch.Tensor,
     ep_group: Optional[dist.ProcessGroup] = None,
     selected_experts: Optional[torch.Tensor] = None,
+    logical_selected_experts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     hidden_dim = hidden_states.size(-1)
     hidden_states = hidden_states.reshape(-1, hidden_dim)
@@ -120,9 +122,14 @@ def token_pre_all2all(
         local_permuted_hidden_states, local_input_permutation_mapping = permute(hidden_states, routing_map)
     else:
         routing_map = None
-        local_permuted_hidden_states, local_input_permutation_mapping = compact_permute(
-            hidden_states, selected_experts
-        )
+        if logical_selected_experts is None:
+            local_permuted_hidden_states, local_input_permutation_mapping = compact_permute(
+                hidden_states, selected_experts
+            )
+        else:
+            local_permuted_hidden_states, local_input_permutation_mapping = alias_permute(
+                hidden_states, selected_experts, logical_selected_experts
+            )
 
     global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
 
@@ -308,6 +315,7 @@ def _dispatch_to_balanced_ep(
         num_global_tokens_per_local_expert=plan.tokens_per_local_physical_expert,
         ep_group=ep_group,
         selected_experts=selected_physical_experts,
+        logical_selected_experts=selected_experts if plan.replicas else None,
     )
 
     fused_replica_backward = permute_tokens.is_cuda and plan.replicas
@@ -451,7 +459,7 @@ def tokens_post_all2all(
     output_splits: torch.Tensor,
     num_global_tokens_per_local_expert: torch.Tensor,
     routing_map: torch.Tensor,
-    local_input_permutation_mapping: torch.Tensor,
+    local_input_permutation_mapping: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     org_hidden_states_shape: torch.Size,
     ep_group: Optional[dist.ProcessGroup] = None,
 ) -> torch.Tensor:
@@ -467,6 +475,10 @@ def tokens_post_all2all(
     unpermute_outputs = all_to_all(ep_group, expert_outputs, input_splits, output_splits)
 
     if routing_map is None:
+        if isinstance(local_input_permutation_mapping, tuple):
+            logical_order, logical_to_physical = local_input_permutation_mapping
+            unpermute_outputs = unpermute_outputs.index_select(0, logical_to_physical)
+            local_input_permutation_mapping = logical_order
         return compact_unpermute(
             unpermute_outputs, routing_weights, org_hidden_states_shape, local_input_permutation_mapping
         )

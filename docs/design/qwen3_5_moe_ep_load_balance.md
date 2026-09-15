@@ -43,6 +43,14 @@ it does not inverse-permute into top-k slot order before summation. Empty ranks
 still participate in communication and autograd. The NPU fused permutation
 path and the disabled-feature path are unchanged.
 
+When aliases are present, dispatch first gathers in logical expert order and
+then applies a one-to-one physical occurrence permutation for all-to-all. The
+inverse physical permutation restores logical order before output combination.
+This preserves both input-gradient accumulation and forward summation order for
+top-k greater than two; stable physical sorting alone is not sufficient when a
+replica changes an occurrence's position relative to another logical expert.
+The extra gathers do not change routing weights, selected occurrences or splits.
+
 Let `E` be the number of logical experts, `R` the EP size, `L = E / R` the original experts per rank, `K` the fixed `max_replicas_per_rank`, and `S = L + K` the physical stride.
 
 - Original logical expert `e` maps to physical ID `floor(e / L) * S + (e mod L)`.
