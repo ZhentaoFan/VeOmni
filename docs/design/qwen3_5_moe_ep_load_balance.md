@@ -75,6 +75,16 @@ Replica-gradient P2P payloads are contiguous on both ends, even when the merged 
 
 Consequently, model parameters, optimizer parameter groups/state, state-dict keys, and checkpoint format do not change. Checkpoint saving remains structurally unchanged. DCP resume with `train.moe_ep_load_balance.enabled=true` is intentionally rejected at configuration time via `train.checkpoint.load_path`. This statement describes the design and CPU/gloo structural tests only; it is not an accelerator checkpoint-resume support claim.
 
+CUDA replica execution places merged expert backward and replica-gradient return
+inside one autograd boundary. Forward weights/activations stay BF16/FP16, while
+partial expert weight gradients and their P2P payloads stay FP32 until the logical
+owner has accumulated all contributions. Only then are owner gradients converted
+to the input parameter dtype. A separate BF16 concatenation edge would otherwise
+round each partial before the owner receives it, even if backward returned FP32.
+This doubles low-precision replica-gradient communication bytes but avoids FP32
+forward-weight copies; it does not promise bitwise agreement with a different
+FP32 GEMM reduction tree. The no-replica, disabled and NPU paths are unchanged.
+
 ## Configuration and failure behavior
 
 `train.moe_ep_load_balance.enabled` defaults to `false`; `max_replicas_per_rank` defaults to `1`. Enabling the feature requires:

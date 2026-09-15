@@ -24,7 +24,9 @@ from .comm import all_to_all
 from .ep_load_balance import (
     EPBalancePlan,
     ExpertReplicaTransfer,
+    _merge_replica_weight_gradients,
     _validate_executor_plan,
+    _validate_replica_weight,
     cat_local_and_replica_weights,
 )
 from .moe_utils import (
@@ -308,21 +310,38 @@ def _dispatch_to_balanced_ep(
         selected_experts=selected_physical_experts,
     )
 
+    fused_replica_backward = permute_tokens.is_cuda and plan.replicas
+    replica_gate_up_proj = None
+    replica_down_proj = None
     if gate_up_transfer is not None and down_transfer is not None:
         replica_gate_up_proj = gate_up_transfer.wait()
         replica_down_proj = down_transfer.wait()
-        gate_up_proj = cat_local_and_replica_weights(gate_up_proj, replica_gate_up_proj, plan, ep_group)
-        down_proj = cat_local_and_replica_weights(down_proj, replica_down_proj, plan, ep_group)
+        if not fused_replica_backward:
+            gate_up_proj = cat_local_and_replica_weights(gate_up_proj, replica_gate_up_proj, plan, ep_group)
+            down_proj = cat_local_and_replica_weights(down_proj, replica_down_proj, plan, ep_group)
 
     physical_counts = plan.tokens_per_local_physical_expert.sum(dim=0)
     cumsum = torch.cumsum(physical_counts, dim=0).to(permute_tokens.device)
-    final_permute_tokens = EPMergedFc1GroupGemm.apply(
-        permute_tokens,
-        cumsum,
-        gate_up_proj,
-        down_proj,
-        swiglu_limit,
-    )
+    if fused_replica_backward:
+        final_permute_tokens = _BalancedEPMergedFc1GroupGemm.apply(
+            permute_tokens,
+            cumsum,
+            gate_up_proj,
+            down_proj,
+            replica_gate_up_proj,
+            replica_down_proj,
+            plan,
+            ep_group,
+            swiglu_limit,
+        )
+    else:
+        final_permute_tokens = EPMergedFc1GroupGemm.apply(
+            permute_tokens,
+            cumsum,
+            gate_up_proj,
+            down_proj,
+            swiglu_limit,
+        )
 
     return tokens_post_all2all(
         expert_outputs=final_permute_tokens,
@@ -725,7 +744,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         return fc2_output
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, *, weight_gradient_dtype=None, weight_needs_grad=None):
         (
             permute_tokens,
             cumsum,
@@ -753,8 +772,8 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
 
         # wgrad fc2
         grad_fc2_weight = None
-        if fc2_weight.requires_grad:
-            grad_fc2_weight = torch.empty_like(fc2_weight)
+        if fc2_weight.requires_grad if weight_needs_grad is None else weight_needs_grad[1]:
+            grad_fc2_weight = torch.empty_like(fc2_weight, dtype=weight_gradient_dtype)
             group_gemm_same_mn(
                 a=grad_output,
                 b=fc1_result,
@@ -788,8 +807,8 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
 
         # single wgrad for merged fc1
         grad_fc1_1_2_weight = None
-        if fc1_1_2_weight.requires_grad:
-            grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight)
+        if fc1_1_2_weight.requires_grad if weight_needs_grad is None else weight_needs_grad[0]:
+            grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight, dtype=weight_gradient_dtype)
             group_gemm_same_mn(
                 a=grad_fc1_output,
                 b=permute_tokens,
@@ -807,3 +826,40 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             grad_fc2_weight,  # fc2_weight
             None,  # swiglu_limit
         )
+
+
+class _BalancedEPMergedFc1GroupGemm(torch.autograd.Function):
+    """Keep partial wgrad and replica reduction inside one FP32 autograd boundary.
+
+    A separate BF16 concatenation edge would cast partial gradients to BF16
+    before the owner can combine them. Forward weights and activations remain
+    in their original dtype; only weight-gradient buffers and P2P use FP32.
+    """
+
+    @staticmethod
+    def forward(ctx, tokens, cumsum, gate, down, replica_gate, replica_down, plan, group, swiglu_limit):
+        _validate_replica_weight(gate, replica_gate, plan, group)
+        _validate_replica_weight(down, replica_down, plan, group)
+        ctx.replica_plan, ctx.replica_group = plan, group
+        ctx.original_weight_dtype = gate.dtype
+        return EPMergedFc1GroupGemm.forward(
+            ctx, tokens, cumsum, torch.cat((gate, replica_gate)), torch.cat((down, replica_down)), swiglu_limit
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        dx, _, dgate, ddown, _ = EPMergedFc1GroupGemm.backward(
+            ctx,
+            grad_output,
+            weight_gradient_dtype=torch.float32,
+            weight_needs_grad=(ctx.needs_input_grad[2], ctx.needs_input_grad[3]),
+        )
+        if dgate is not None:
+            dgate = _merge_replica_weight_gradients(dgate, ctx.replica_plan, ctx.replica_group).to(
+                ctx.original_weight_dtype
+            )
+        if ddown is not None:
+            ddown = _merge_replica_weight_gradients(ddown, ctx.replica_plan, ctx.replica_group).to(
+                ctx.original_weight_dtype
+            )
+        return dx, None, dgate, ddown, None, None, None, None, None

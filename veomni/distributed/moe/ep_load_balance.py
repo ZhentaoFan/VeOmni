@@ -205,39 +205,38 @@ class _CatLocalAndReplicaWeights(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
-        plan = ctx.plan
-        ep_group = ctx.ep_group
-        ep_rank = dist.get_rank(group=ep_group)
-        local_grad = grad_output[: plan.num_local_experts].clone()
-        work_handles: list[dist.Work] = []
-        communication_tensors: list[torch.Tensor] = []
-        received_gradients: list[tuple[int, torch.Tensor]] = []
+        return _merge_replica_weight_gradients(grad_output, ctx.plan, ctx.ep_group), None, None, None
 
-        for replica in plan.replicas:
-            if ep_rank == replica.target_rank:
-                send_tensor = grad_output[plan.num_local_experts + replica.target_slot].contiguous()
-                owner_global_rank = dist.get_global_rank(ep_group, replica.source_rank)
-                work = dist.isend(send_tensor, dst=owner_global_rank, group=ep_group)
-                communication_tensors.append(send_tensor)
-                work_handles.append(work)
-            elif ep_rank == replica.source_rank:
-                # Transposed expert GEMMs can return non-contiguous gradients.
-                # P2P payloads must use the same dense layout as the sender.
-                recv_tensor = torch.empty_like(
-                    local_grad[replica.source_local_expert], memory_format=torch.contiguous_format
-                )
-                target_global_rank = dist.get_global_rank(ep_group, replica.target_rank)
-                work = dist.irecv(recv_tensor, src=target_global_rank, group=ep_group)
-                communication_tensors.append(recv_tensor)
-                received_gradients.append((replica.source_local_expert, recv_tensor))
-                work_handles.append(work)
 
-        for work in work_handles:
-            work.wait()
-        for source_local_expert, received_gradient in received_gradients:
-            local_grad[source_local_expert].add_(received_gradient)
-
-        return local_grad, None, None, None
+def _merge_replica_weight_gradients(
+    grad_output: torch.Tensor, plan: EPBalancePlan, ep_group: dist.ProcessGroup
+) -> torch.Tensor:
+    """Return replica contributions to owners without changing the input dtype."""
+    ep_rank = dist.get_rank(group=ep_group)
+    local_grad = grad_output[: plan.num_local_experts].clone()
+    work_handles: list[dist.Work] = []
+    communication_tensors: list[torch.Tensor] = []
+    received_gradients: list[tuple[int, torch.Tensor]] = []
+    for replica in plan.replicas:
+        if ep_rank == replica.target_rank:
+            send_tensor = grad_output[plan.num_local_experts + replica.target_slot].contiguous()
+            owner_global_rank = dist.get_global_rank(ep_group, replica.source_rank)
+            work_handles.append(dist.isend(send_tensor, dst=owner_global_rank, group=ep_group))
+            communication_tensors.append(send_tensor)
+        elif ep_rank == replica.source_rank:
+            # Sender and receiver must agree on contiguous logical row layout.
+            recv_tensor = torch.empty_like(
+                local_grad[replica.source_local_expert], memory_format=torch.contiguous_format
+            )
+            target_global_rank = dist.get_global_rank(ep_group, replica.target_rank)
+            work_handles.append(dist.irecv(recv_tensor, src=target_global_rank, group=ep_group))
+            communication_tensors.append(recv_tensor)
+            received_gradients.append((replica.source_local_expert, recv_tensor))
+    for work in work_handles:
+        work.wait()
+    for source_local_expert, received_gradient in received_gradients:
+        local_grad[source_local_expert].add_(received_gradient)
+    return local_grad
 
 
 def cat_local_and_replica_weights(
