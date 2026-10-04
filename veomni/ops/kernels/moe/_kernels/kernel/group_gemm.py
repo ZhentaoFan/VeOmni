@@ -267,9 +267,13 @@ def group_gemm_same_mn_kernel(
     GROUP: tl.constexpr,
     M_ALIGNED: tl.constexpr,
     N_ALIGNED: tl.constexpr,
+    group_indices_ptr=None,
+    HAS_GROUP_INDICES: tl.constexpr = False,
 ):
     m, n = get_pid_mn(tl.program_id(axis=0), M, N, BLOCK_M, BLOCK_N, GROUP)
     gid = tl.program_id(1).to(tl.uint64)
+    if HAS_GROUP_INDICES:
+        gid = tl.load(group_indices_ptr + gid).to(tl.uint64)
     gtid_start = tl.load(cumsum_K + gid - 1, mask=gid > 0, other=0)
     gtid_end = tl.load(cumsum_K + gid)
     k = (gtid_end - gtid_start).to(tl.uint64)
@@ -337,7 +341,7 @@ def group_gemm_same_mn_kernel(
         return
 
     if ACCUMULATE_TO_C:
-        out = tl.load(c_block_ptr).to(tl.float32)
+        out = load_block_with_pred_2d(c_block_ptr, M_ALIGNED, N_ALIGNED).to(tl.float32)
     else:
         out = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
