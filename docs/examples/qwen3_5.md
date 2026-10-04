@@ -233,6 +233,130 @@ The config sets `ulysses_size: 4`, so the world size must be a multiple of 4. To
 sequence parallelism, override `--model.accelerator.ulysses_size 1`; the attention kernels adapt
 on their own.
 
+## Qwen3.5-MoE EP load-balance experiments
+
+Balancing is disabled by default. Review the [design's support boundaries](../design/qwen3_5_moe_ep_load_balance.md#scope-and-configuration) before opting in.
+The rebased source has only local CPU/Gloo/static validation; accelerator
+precision, performance and memory remain untested on this revision. The
+[evidence index](../performance/qwen3_5_moe_ep_evidence.md) separates earlier
+hardware results, including native-route regressions, from current validation.
+
+Use Bash for the arrays below. Pin immutable local model/data revisions and
+save the resolved config, environment, source hashes and raw output for each
+arm. This AscendC recipe requires its documented NPU dependencies; CUDA runs
+must use the CUDA recipe/backends. Keep paired commands identical except
+enablement and output/run labels. This template sets SP1/EP2 on eight devices,
+does not claim other topology support, and is not a published hardware result.
+
+### Shared setup and functional comparison
+
+The recipe enables profiling by default; override it for functional and
+throughput comparisons. Freeze the ordinary gradient-checkpointing choice in
+the shared settings.
+
+```bash
+CONFIG=configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml
+MODEL=${HOME}/Qwen3.5-35B-A3B
+DATA=./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+
+COMMON=(
+  --model.model_path "$MODEL"
+  --data.train_path "$DATA"
+  --model.accelerator.ulysses_size 1
+  --model.accelerator.ep_size 2
+  --model.accelerator.gradient_checkpointing.enable true
+  --train.moe_ep_load_balance.max_replicas_per_rank 1
+  --train.checkpoint.save_steps 0
+  --train.checkpoint.save_epochs 0
+  --train.checkpoint.save_hf_weights false
+  --train.seed 0
+)
+
+for MODE in false true; do
+  OUT=./exp/qwen3_5_ep_functional_$MODE
+  NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${COMMON[@]}" \
+    --train.moe_ep_load_balance.enabled "$MODE" \
+    --train.profile.enable false \
+    --train.moe_load_balance_monitor_interval 1 \
+    --train.max_steps 20 \
+    --train.wandb.name "qwen3_5_ep_functional_$MODE" \
+    --train.checkpoint.output_dir "$OUT"
+done
+```
+
+Inspect complete finite loss/gradient trajectories and positive replica/move
+telemetry, not only the first loss or a balanced heatmap. The strict four-device
+CI E2E uses a deterministic two-step hotspot with exact count/imbalance checks;
+its forced routing and blocking launch are not throughput evidence.
+
+### Steady-state performance comparison
+
+Reuse `CONFIG` and `COMMON` from above. Disable monitoring and profiling to
+exclude their synchronization/formatting costs, and predeclare warmup (20 of
+these 100 steps) before collecting results.
+
+```bash
+for MODE in false true; do
+  OUT=./exp/qwen3_5_ep_perf_$MODE
+  NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${COMMON[@]}" \
+    --train.moe_ep_load_balance.enabled "$MODE" \
+    --train.profile.enable false \
+    --train.moe_load_balance_monitor_interval 0 \
+    --train.max_steps 100 \
+    --train.wandb.name "qwen3_5_ep_perf_$MODE" \
+    --train.checkpoint.output_dir "$OUT"
+done
+```
+
+Artifacts need explicit `step_time_s` and `step_tokens` or
+`tokens_per_second`; allocator/host peaks use
+`peak_accelerator_memory_bytes`/`peak_host_memory_bytes`.
+Optional `p2p_bytes` and `p2p_wait_time_s` require one value per loss/gradient
+step from trace post-processing or runtime export. Neither these commands nor
+the reporter automatically collects them. Do not infer missing P2P or memory.
+
+### All-rank profiler diagnosis
+
+Reuse the same shared setup. Capture both arms separately on every rank; these
+traces diagnose execution and are excluded from the throughput comparison.
+
+```bash
+for MODE in false true; do
+  OUT=./exp/qwen3_5_ep_profile_$MODE
+  NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${COMMON[@]}" \
+    --train.moe_ep_load_balance.enabled "$MODE" \
+    --train.profile.enable true \
+    --train.profile.rank0_only false \
+    --train.profile.start_step 20 \
+    --train.profile.end_step 25 \
+    --train.profile.trace_dir "$OUT/traces" \
+    --train.moe_load_balance_monitor_interval 0 \
+    --train.max_steps 26 \
+    --train.checkpoint.output_dir "$OUT"
+done
+```
+
+### Compare saved artifacts
+
+The standard-library reporter accepts schema-version-1 envelopes, flat
+`log_dict.json`, per-step JSONL or plain loss/gradient logs:
+
+```bash
+python scripts/profile/compare_moe_ep_load_balance.py \
+  --baseline ./artifacts/baseline.json \
+  --candidate ./artifacts/enabled.json \
+  --warmup-steps 20 --rtol 0.1 --atol 0.1 \
+  --relative-error-threshold 0.1 --epsilon 1e-12 \
+  --json-out ./artifacts/comparison.json \
+  --markdown-out ./artifacts/comparison.md
+```
+
+Precision failure returns nonzero after writing both reports. Missing optional
+performance/P2P/memory fields produce `unavailable` with `null` values, not a
+fabricated zero or a comparison failure. A precision pass is separate from a
+performance-benefit gate; choose tolerances, warmup and benefit criteria before
+the run. See the design for formulas, telemetry and rollback.
+
 ### Qwen3.5 MoE 35B VL Muon training
 
 The Ascend VL recipe uses UP1 and EP4, `fused_npu` MoE, the AscendC GatedDeltaNet
